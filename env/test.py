@@ -8,6 +8,7 @@ class GameUI(tk.Tk):
         super().__init__()
         self.title('2048 Game')
         self.geometry('400x400')
+        self.total_reward = 0
         
         self.game = game.Game()
         
@@ -33,6 +34,8 @@ class GameUI(tk.Tk):
         if key in moves:
             old_state = [row.copy() for row in self.game.get_state()]
             _, reward, done = self.game.action(moves[key])
+            self.total_reward += reward
+            print(self.total_reward)
             new_state = self.game.get_state()
             self.animate_movement(old_state, new_state)
             if done:
