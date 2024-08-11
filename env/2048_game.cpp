@@ -266,14 +266,14 @@ std::tuple<std::vector<std::vector<int>>, long long, bool> action(int action)
     
     if(can_make_move() && changes == 0 && part_reward == 0) {
         bool done = !can_make_move();
-        return std::make_tuple(state, -100, done);
+        return std::make_tuple(state, -10, done);
     }
     if(changes > 0 || part_reward > 0) {
         try_spawn_new_tile();
     }
     bool done = !can_make_move();
     if(done == true) {
-        return std::make_tuple(state, -500, done);
+        return std::make_tuple(state, -100, done);
     }
     return std::make_tuple(state, part_reward, done);
 }
