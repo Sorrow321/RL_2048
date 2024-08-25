@@ -229,7 +229,12 @@ Game() : state(4, std::vector<int>(4, 0)), dev(), rng(dev()), score(0)
     try_spawn_new_tile();
 }
 
-std::tuple<std::vector<std::vector<int>>, long long, bool> action(int action)
+std::tuple<
+    std::vector<std::vector<int>>,
+    std::pair<std::vector<std::vector<std::vector<int>>>, std::vector<double>>,
+    long long,
+    bool
+> action(int action)
 {
     /*
         action:
@@ -263,19 +268,54 @@ std::tuple<std::vector<std::vector<int>>, long long, bool> action(int action)
     }
     score += part_reward;
 
-    
+    auto state_before_spawning = state;
     if(can_make_move() && changes == 0 && part_reward == 0) {
         bool done = !can_make_move();
-        return std::make_tuple(state, -10, done);
+        return std::make_tuple(state, get_possible_positions(state_before_spawning), -10, done);
     }
+    
     if(changes > 0 || part_reward > 0) {
         try_spawn_new_tile();
     }
     bool done = !can_make_move();
     if(done == true) {
-        return std::make_tuple(state, -100, done);
+        part_reward = -100;
     }
-    return std::make_tuple(state, part_reward, done);
+    return std::make_tuple(state, get_possible_positions(state_before_spawning), part_reward, done);
+}
+
+std::pair<std::vector<std::vector<std::vector<int>>>, std::vector<double>> get_possible_positions(
+    std::vector<std::vector<int>> state_before_spawning
+)
+{
+    std::vector<std::pair<int, int>> empty_places;
+    for(int i = 0; i < 4; i++) {
+        for(int j = 0; j < 4; j++) {
+            if (state[i][j] == 0) {
+                empty_places.push_back({i, j});
+            }
+        }
+    }
+
+    std::vector<std::vector<std::vector<int>>> state_candidates;
+    std::vector<double> probas; 
+    auto state_copy = state_before_spawning;
+    
+    for(size_t t = 0; t < empty_places.size(); t++) {
+        auto [i, j] = empty_places[t];
+        
+        state_copy[i][j] = 2;
+        state_candidates.push_back(state_copy);
+        probas.push_back(0.9);
+        state_copy[i][j] = 4;
+        state_candidates.push_back(state_copy);
+        probas.push_back(0.1);
+        state_copy[i][j] = 0;
+    }
+    for(size_t t = 0; t < probas.size(); t++) {
+        probas[t] /= (probas.size() / 2);
+    }
+    return {state_candidates, probas};
 }
 
 /*
