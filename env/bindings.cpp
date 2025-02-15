@@ -9,8 +9,9 @@ PYBIND11_MODULE(game, m) {
 
     py::class_<Game>(m, "Game")
         .def(py::init<>())
-        .def("action", &Game::action)
+        .def("simulate_action", &Game::simulate_action)
         .def("get_state", &Game::get_state)
         .def("get_current_score", &Game::get_current_score)
-        .def("reset", &Game::reset);
+        .def("reset", &Game::reset)
+        .def("get_possible_actions", &Game::get_possible_actions);
 }

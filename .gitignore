@@ -1,4 +1,9 @@
+*
+!/**/
+!*.*
+*.so
 *.out
 *.so
 build/
 .vscode
+__pycache__
