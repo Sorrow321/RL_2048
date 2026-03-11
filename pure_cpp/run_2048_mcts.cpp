@@ -197,19 +197,23 @@ public:
             for(int col=0; col<4; col++){
                 int idx = 3; 
                 int last_val = 0;
+                int last_row = -1;
                 for(int row=3; row>=0; row--){
                     if(res[row][col]!=0 && last_val==0){
                         last_val = res[row][col];
+                        last_row = row;
                     }
                     else if(res[row][col]!=0){
                         if(last_val == res[row][col]){
+                            if(last_row != idx) res[last_row][col] = 0;
+                            if(row != idx) res[row][col] = 0;
                             res[idx][col] = last_val * 2;
                             partial_reward += res[idx][col];
-                            res[row][col] = 0;
                             last_val=0;
                             idx--;
                         } else {
                             last_val = res[row][col];
+                            last_row = row;
                             idx--;
                         }
                     }
@@ -221,19 +225,23 @@ public:
             for(int col=0; col<4; col++){
                 int idx = 0;
                 int last_val = 0;
+                int last_row = -1;
                 for(int row=0; row<4; row++){
                     if(res[row][col]!=0 && last_val==0){
                         last_val = res[row][col];
+                        last_row = row;
                     }
                     else if(res[row][col]!=0){
                         if(last_val == res[row][col]){
+                            if(last_row != idx) res[last_row][col] = 0;
+                            if(row != idx) res[row][col] = 0;
                             res[idx][col] = last_val*2;
                             partial_reward += res[idx][col];
-                            res[row][col] = 0;
                             last_val=0;
                             idx++;
                         } else {
                             last_val = res[row][col];
+                            last_row = row;
                             idx++;
                         }
                     }
@@ -245,19 +253,23 @@ public:
             for(int row=0; row<4; row++){
                 int idx = 3;
                 int last_val = 0;
+                int last_col = -1;
                 for(int col=3; col>=0; col--){
                     if(res[row][col]!=0 && last_val==0){
                         last_val=res[row][col];
+                        last_col = col;
                     }
                     else if(res[row][col]!=0){
                         if(last_val == res[row][col]){
+                            if(last_col != idx) res[row][last_col] = 0;
+                            if(col != idx) res[row][col] = 0;
                             res[row][idx] = last_val*2;
                             partial_reward += res[row][idx];
-                            res[row][col] = 0;
                             last_val=0;
                             idx--;
                         } else {
                             last_val = res[row][col];
+                            last_col = col;
                             idx--;
                         }
                     }
@@ -269,19 +281,23 @@ public:
             for(int row=0; row<4; row++){
                 int idx = 0;
                 int last_val = 0;
+                int last_col = -1;
                 for(int col=0; col<4; col++){
                     if(res[row][col]!=0 && last_val==0){
                         last_val = res[row][col];
+                        last_col = col;
                     }
                     else if(res[row][col]!=0){
                         if(last_val == res[row][col]){
+                            if(last_col != idx) res[row][last_col] = 0;
+                            if(col != idx) res[row][col] = 0;
                             res[row][idx] = last_val*2;
                             partial_reward += res[row][idx];
-                            res[row][col] = 0;
                             last_val=0;
                             idx++;
                         } else {
                             last_val = res[row][col];
+                            last_col = col;
                             idx++;
                         }
                     }
@@ -720,6 +736,12 @@ public:
         return root->actions[best_idx];
     }
 
+    bool has_root() const
+    {
+        std::shared_lock<std::shared_mutex> lock(tree_mutex);
+        return root != nullptr;
+    }
+
     // Choose the next state matching the environment outcome to "re-root" the tree.
     void select_branch(int action, const std::vector<std::vector<int>> &new_state)
     {
@@ -826,6 +848,9 @@ int main()
 
         // Re-root the tree based on the chosen action and resulting state.
         mcts.select_branch(best_a, state);
+        if (!mcts.has_root()) {
+            mcts.init_root(state);
+        }
         step++;
     }
 
