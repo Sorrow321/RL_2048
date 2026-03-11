@@ -41,6 +41,7 @@ class GameUI(tk.Tk):
             if done:
                 messagebox.showinfo('Game Over', f'Final Score: {self.game.get_current_score()}')
                 self.game = game.Game()
+                self.total_reward = 0
                 self.update_ui()
 
     def animate_movement(self, old_state, new_state):

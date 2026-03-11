@@ -136,84 +136,88 @@ long long merge(int direction)
     long long partial_reward = 0;
     if (direction == 0) {
         for(int j = 0; j < 4; j++) {
-            int idx = 3;
             int last_val = 0;
+            int last_pos = -1;
             for(int i = 3; i >= 0; i--) {
                 if(state[i][j] != 0 && last_val == 0) {
                     last_val = state[i][j];
+                    last_pos = i;
                 }else if(state[i][j] != 0) {
                     if(last_val == state[i][j]) {
-                        state[idx][j] = last_val * 2;
+                        state[last_pos][j] = last_val * 2;
                         state[i][j] = 0;
-                        partial_reward += state[idx][j];
+                        partial_reward += state[last_pos][j];
                         last_val = 0;
-                        idx--;
+                        last_pos = -1;
                     }else{
                         last_val = state[i][j];
-                        idx--;
+                        last_pos = i;
                     }
                 }
             }
         }
     }else if(direction == 1) {
         for(int j = 0; j < 4; j++) {
-            int idx = 0;
             int last_val = 0;
+            int last_pos = -1;
             for(int i = 0; i < 4; i++) {
                 if(state[i][j] != 0 && last_val == 0) {
                     last_val = state[i][j];
+                    last_pos = i;
                 }else if(state[i][j] != 0) {
                     if(last_val == state[i][j]) {
-                        state[idx][j] = last_val * 2;
+                        state[last_pos][j] = last_val * 2;
                         state[i][j] = 0;
-                        partial_reward += state[idx][j];
+                        partial_reward += state[last_pos][j];
                         last_val = 0;
-                        idx++;
+                        last_pos = -1;
                     }else{
                         last_val = state[i][j];
-                        idx++;
+                        last_pos = i;
                     }
                 }
             }
         }
     }else if(direction == 2) {
         for(int i = 0; i < 4; i++) {
-            int idx = 3;
             int last_val = 0;
+            int last_pos = -1;
             for(int j = 3; j >= 0; j--) {
                 if(state[i][j] != 0 && last_val == 0) {
                     last_val = state[i][j];
+                    last_pos = j;
                 }else if(state[i][j] != 0) {
                     if(last_val == state[i][j]) {
-                        state[i][idx] = last_val * 2;
+                        state[i][last_pos] = last_val * 2;
                         state[i][j] = 0;
-                        partial_reward += state[i][idx];
+                        partial_reward += state[i][last_pos];
                         last_val = 0;
-                        idx--;
+                        last_pos = -1;
                     }else{
                         last_val = state[i][j];
-                        idx--;
+                        last_pos = j;
                     }
                 }
             }
         }
     }else if(direction == 3) {
         for(int i = 0; i < 4; i++) {
-            int idx = 0;
             int last_val = 0;
+            int last_pos = -1;
             for(int j = 0; j < 4; j++) {
                 if(state[i][j] != 0 && last_val == 0) {
                     last_val = state[i][j];
+                    last_pos = j;
                 }else if(state[i][j] != 0) {
                     if(last_val == state[i][j]) {
-                        state[i][idx] = last_val * 2;
+                        state[i][last_pos] = last_val * 2;
                         state[i][j] = 0;
-                        partial_reward += state[i][idx];
+                        partial_reward += state[i][last_pos];
                         last_val = 0;
-                        idx++;
+                        last_pos = -1;
                     }else{
                         last_val = state[i][j];
-                        idx++;
+                        last_pos = j;
                     }
                 }
             }
@@ -242,7 +246,7 @@ std::tuple<std::vector<std::vector<int>>, long long, bool> action(int action)
         throw std::invalid_argument("Bad action idx");
     }
 
-    long long part_reward;
+    long long part_reward = 0;
     int changes = 0;
     if(action == 0) {
         changes += slide(0);
@@ -265,8 +269,7 @@ std::tuple<std::vector<std::vector<int>>, long long, bool> action(int action)
 
     
     if(can_make_move() && changes == 0 && part_reward == 0) {
-        bool done = !can_make_move();
-        return std::make_tuple(state, -10, done);
+        return std::make_tuple(state, (long long)-10, false);
     }
     if(changes > 0 || part_reward > 0) {
         try_spawn_new_tile();
@@ -301,7 +304,16 @@ const std::vector<std::vector<int>>& get_state()
     return state;
 }
 
-int get_current_score()
+void set_state(const std::vector<std::vector<int>>& new_state)
+{
+    for(int i = 0; i < 4; i++) {
+        for(int j = 0; j < 4; j++) {
+            state[i][j] = new_state[i][j];
+        }
+    }
+}
+
+long long get_current_score()
 {
     return score;
 }

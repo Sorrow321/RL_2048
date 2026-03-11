@@ -11,6 +11,7 @@ PYBIND11_MODULE(game, m) {
         .def(py::init<>())
         .def("action", &Game::action)
         .def("get_state", &Game::get_state)
+        .def("set_state", &Game::set_state)
         .def("get_current_score", &Game::get_current_score)
         .def("reset", &Game::reset);
 }
