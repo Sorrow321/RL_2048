@@ -1,576 +1,407 @@
 /****************************************************
- * run_2048_mcts_parallel.cpp
- * 
- * Demonstrates a single-file example of MCTS on 2048
- * with partial "tree parallelization" + "rollout
- * parallelization" using OpenMP.
+ * run_2048_mcts.cpp
  *
- * Compile: g++ -std=c++17 -O2 -fopenmp run_2048_mcts_parallel.cpp -o run_2048_mcts_parallel
+ * MCTS for 2048 with:
+ *   - Bitboard representation (uint64_t, 4-bit nibbles)
+ *   - Lookup-table slide/merge
+ *   - Heuristic leaf evaluation (no random rollouts)
+ *   - Sampled chance nodes (not fully enumerated)
+ *   - Sequential iteration (bitboard + O(1) eval = high throughput)
+ *
+ * Compile: g++ -std=c++17 -O3 run_2048_mcts.cpp -o run_2048_mcts
  ****************************************************/
 
 #include <iostream>
 #include <vector>
 #include <random>
-#include <tuple>
-#include <stdexcept>
 #include <cmath>
 #include <algorithm>
 #include <memory>
-#include <ctime>
 #include <cassert>
-#include <mutex>       // For std::mutex
-#include <shared_mutex>  // C++17 shared mutex
-#include <omp.h>       // OpenMP header
+#include <array>
+#include <unordered_map>
+#include <cstdint>
+#include <chrono>
 
 ////////////////////////////////////////////////////////////////////////////////
-// 1) Basic 2048 Mechanics
+// 1) Bitboard 2048 Engine
+//
+// Board = uint64_t, 16 nibbles. Each nibble stores log2(tile_value), with 0
+// meaning empty. So nibble=1 means tile 2, nibble=11 means tile 2048, etc.
+// Layout: nibble 0 = board[0][0], nibble 1 = board[0][1], ..., nibble 15 = board[3][3]
+// i.e. row-major: nibble index = row*4 + col.
+//
+// A "row" is a 16-bit value (4 nibbles). We precompute tables for sliding
+// and merging a single row to the left, then derive all 4 directions.
 ////////////////////////////////////////////////////////////////////////////////
 
-class Game
-{
-private:
-    // 4x4 board
-    std::vector<std::vector<int>> state;
-    long long score;
+using Board = uint64_t;
+using Row = uint16_t;
 
-    std::random_device dev;
-    std::mt19937 rng;
+static Row   slide_left_table[65536];
+static Row   slide_right_table[65536];
+static int   merge_score_table[65536];
+static double heuristic_table[65536];
 
-public:
-    Game()
-    : state(4, std::vector<int>(4, 0)),
-      score(0),
-      rng(dev())
-    {
-        try_spawn_new_tile();
-        try_spawn_new_tile();
+static inline int nibble(Board b, int pos) {
+    return (b >> (pos * 4)) & 0xF;
+}
+
+static inline Board set_nibble(Board b, int pos, int val) {
+    Board mask = ~(0xFULL << (pos * 4));
+    return (b & mask) | ((Board)val << (pos * 4));
+}
+
+static inline Row get_row(Board b, int row) {
+    return (Row)(b >> (row * 16));
+}
+
+static inline Board set_row(Board b, int row, Row r) {
+    Board mask = ~(0xFFFFULL << (row * 16));
+    return (b & mask) | ((Board)r << (row * 16));
+}
+
+static Row reverse_row(Row r) {
+    return ((r & 0xF) << 12) | (((r >> 4) & 0xF) << 8) |
+           (((r >> 8) & 0xF) << 4) | ((r >> 12) & 0xF);
+}
+
+static void init_tables() {
+    for (int r = 0; r < 65536; r++) {
+        Row row = (Row)r;
+        int c[4] = {row & 0xF, (row >> 4) & 0xF, (row >> 8) & 0xF, (row >> 12) & 0xF};
+
+        // --- Slide left + merge ---
+        // Compact left
+        int a[4] = {0, 0, 0, 0};
+        int pos = 0;
+        for (int i = 0; i < 4; i++) {
+            if (c[i] != 0) a[pos++] = c[i];
+        }
+        // Merge adjacent equal pairs
+        int score = 0;
+        int b[4] = {0, 0, 0, 0};
+        int bpos = 0;
+        for (int i = 0; i < 4; ) {
+            if (i < 3 && a[i] != 0 && a[i] == a[i + 1]) {
+                b[bpos++] = a[i] + 1;
+                score += (1 << (a[i] + 1));
+                i += 2;
+            } else {
+                b[bpos++] = a[i];
+                i++;
+            }
+        }
+
+        Row result = (Row)(b[0] | (b[1] << 4) | (b[2] << 8) | (b[3] << 12));
+        slide_left_table[r] = result;
+        slide_right_table[reverse_row(row)] = reverse_row(result);
+        merge_score_table[r] = score;
+
+        // --- Row heuristic contribution (on ORIGINAL row values c[], not post-slide b[]) ---
+        double empty_count = 0;
+        double mono_lr = 0, mono_rl = 0;
+        double merge_potential = 0;
+        double sum_val = 0;
+        for (int i = 0; i < 4; i++) {
+            if (c[i] == 0) empty_count += 1.0;
+            if (c[i] > 0) sum_val += (1 << c[i]);
+        }
+        for (int i = 0; i < 3; i++) {
+            if (c[i] > 0 && c[i + 1] > 0) {
+                if (c[i] > c[i + 1])      mono_lr += (1 << c[i]) - (1 << c[i + 1]);
+                else if (c[i] < c[i + 1]) mono_rl += (1 << c[i + 1]) - (1 << c[i]);
+            }
+            if (c[i] != 0 && c[i] == c[i + 1])
+                merge_potential += (1 << (c[i] + 1));
+        }
+        double monotonicity = -std::min(mono_lr, mono_rl);
+
+        heuristic_table[r] = 200.0 * empty_count
+                           + 1.0 * monotonicity
+                           + 1.0 * merge_potential;
     }
+}
 
-    // Return board
-    const std::vector<std::vector<int>>& get_state() const
-    {
-        return state;
-    }
+static Board transpose(Board b) {
+    // Transpose the 4x4 grid so rows become columns.
+    // nibble(row, col) -> nibble(col, row)
+    Board t = 0;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            t = set_nibble(t, c * 4 + r, nibble(b, r * 4 + c));
+    return t;
+}
 
-    long long get_current_score() const
-    {
-        return score;
-    }
-
-    // Reset board
-    std::vector<std::vector<int>> reset()
-    {
-        score = 0;
-        for(int i=0; i<4; i++){
-            for(int j=0; j<4; j++){
-                state[i][j] = 0;
-            }
-        }
-        try_spawn_new_tile();
-        try_spawn_new_tile();
-        return state;
-    }
-
-    bool try_spawn_new_tile()
-    {
-        std::vector<std::pair<int,int>> empty_places;
-        for(int i=0; i<4; i++){
-            for(int j=0; j<4; j++){
-                if(state[i][j]==0) {
-                    empty_places.push_back({i,j});
-                }
-            }
-        }
-        if(empty_places.empty()) {
-            return false;
-        }
-        std::uniform_int_distribution<> dist(0, (int)empty_places.size()-1);
-        int rpos = dist(rng);
-        auto [rr, cc] = empty_places[rpos];
-
-        std::uniform_real_distribution<double> p_dist(0.0,1.0);
-        double p = p_dist(rng);
-        int val = (p<0.1)?4:2;
-        state[rr][cc] = val;
-        return true;
-    }
-
-    bool can_make_move(const std::vector<std::vector<int>>& st) const
-    {
-        for(int i=0; i<4; i++){
-            for(int j=0; j<4; j++){
-                if(st[i][j] == 0){
-                    return true;
-                }
-                if(j>0 && st[i][j] == st[i][j-1]){
-                    return true;
-                }
-                if(i>0 && st[i][j] == st[i-1][j]){
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    // Slide + merge logic
-    std::pair<std::vector<std::vector<int>>, int>
-    slide(const std::vector<std::vector<int>>& st, int action) const
-    {
-        // action: 0=down,1=up,2=right,3=left
-        std::vector<std::vector<int>> res = st;
-        int changes = 0;
-        if(action==0) {
-            // down
-            for(int col=0; col<4; col++){
-                int idx = 3;
-                for(int row=3; row>=0; row--){
-                    if(res[row][col]!=0){
-                        if(idx!=row){
-                            changes++;
-                            res[idx][col] = res[row][col];
-                            res[row][col] = 0;
-                        }
-                        idx--;
-                    }
-                }
-            }
-        }
-        else if(action==1){
-            // up
-            for(int col=0; col<4; col++){
-                int idx = 0;
-                for(int row=0; row<4; row++){
-                    if(res[row][col]!=0){
-                        if(idx!=row){
-                            changes++;
-                            res[idx][col] = res[row][col];
-                            res[row][col] = 0;
-                        }
-                        idx++;
-                    }
-                }
-            }
-        }
-        else if(action==2){
-            // right
-            for(int row=0; row<4; row++){
-                int idx = 3;
-                for(int col=3; col>=0; col--){
-                    if(res[row][col]!=0){
-                        if(idx!=col){
-                            changes++;
-                            res[row][idx] = res[row][col];
-                            res[row][col] = 0;
-                        }
-                        idx--;
-                    }
-                }
-            }
-        }
-        else if(action==3){
-            // left
-            for(int row=0; row<4; row++){
-                int idx = 0;
-                for(int col=0; col<4; col++){
-                    if(res[row][col]!=0){
-                        if(idx!=col){
-                            changes++;
-                            res[row][idx] = res[row][col];
-                            res[row][col] = 0;
-                        }
-                        idx++;
-                    }
-                }
-            }
-        }
-        return {res, changes};
-    }
-
-    std::pair<std::vector<std::vector<int>>, long long>
-    merge(const std::vector<std::vector<int>>& st, int action) const
-    {
-        std::vector<std::vector<int>> res = st;
-        long long partial_reward = 0;
-        if(action==0){
-            // down
-            for(int col=0; col<4; col++){
-                int idx = 3; 
-                int last_val = 0;
-                int last_row = -1;
-                for(int row=3; row>=0; row--){
-                    if(res[row][col]!=0 && last_val==0){
-                        last_val = res[row][col];
-                        last_row = row;
-                    }
-                    else if(res[row][col]!=0){
-                        if(last_val == res[row][col]){
-                            if(last_row != idx) res[last_row][col] = 0;
-                            if(row != idx) res[row][col] = 0;
-                            res[idx][col] = last_val * 2;
-                            partial_reward += res[idx][col];
-                            last_val=0;
-                            idx--;
-                        } else {
-                            last_val = res[row][col];
-                            last_row = row;
-                            idx--;
-                        }
-                    }
-                }
-            }
-        }
-        else if(action==1){
-            // up
-            for(int col=0; col<4; col++){
-                int idx = 0;
-                int last_val = 0;
-                int last_row = -1;
-                for(int row=0; row<4; row++){
-                    if(res[row][col]!=0 && last_val==0){
-                        last_val = res[row][col];
-                        last_row = row;
-                    }
-                    else if(res[row][col]!=0){
-                        if(last_val == res[row][col]){
-                            if(last_row != idx) res[last_row][col] = 0;
-                            if(row != idx) res[row][col] = 0;
-                            res[idx][col] = last_val*2;
-                            partial_reward += res[idx][col];
-                            last_val=0;
-                            idx++;
-                        } else {
-                            last_val = res[row][col];
-                            last_row = row;
-                            idx++;
-                        }
-                    }
-                }
-            }
-        }
-        else if(action==2){
-            // right
-            for(int row=0; row<4; row++){
-                int idx = 3;
-                int last_val = 0;
-                int last_col = -1;
-                for(int col=3; col>=0; col--){
-                    if(res[row][col]!=0 && last_val==0){
-                        last_val=res[row][col];
-                        last_col = col;
-                    }
-                    else if(res[row][col]!=0){
-                        if(last_val == res[row][col]){
-                            if(last_col != idx) res[row][last_col] = 0;
-                            if(col != idx) res[row][col] = 0;
-                            res[row][idx] = last_val*2;
-                            partial_reward += res[row][idx];
-                            last_val=0;
-                            idx--;
-                        } else {
-                            last_val = res[row][col];
-                            last_col = col;
-                            idx--;
-                        }
-                    }
-                }
-            }
-        }
-        else if(action==3){
-            // left
-            for(int row=0; row<4; row++){
-                int idx = 0;
-                int last_val = 0;
-                int last_col = -1;
-                for(int col=0; col<4; col++){
-                    if(res[row][col]!=0 && last_val==0){
-                        last_val = res[row][col];
-                        last_col = col;
-                    }
-                    else if(res[row][col]!=0){
-                        if(last_val == res[row][col]){
-                            if(last_col != idx) res[row][last_col] = 0;
-                            if(col != idx) res[row][col] = 0;
-                            res[row][idx] = last_val*2;
-                            partial_reward += res[row][idx];
-                            last_val=0;
-                            idx++;
-                        } else {
-                            last_val = res[row][col];
-                            last_col = col;
-                            idx++;
-                        }
-                    }
-                }
-            }
-        }
-        return {res, partial_reward};
-    }
-
-    // Return all next states from a given state+action, with probabilities
-    std::tuple<
-        std::vector<std::vector<std::vector<int>>>,
-        std::vector<double>,
-        std::vector<long long>,
-        std::vector<bool>
-    > simulate_action(const std::vector<std::vector<int>>& st, int action) const
-    {
-        auto [s1, c1] = slide(st, action);
-        auto [s2, mr] = merge(s1, action);
-        auto [s3, c2] = slide(s2, action);
-
-        // find empties
-        std::vector<std::pair<int,int>> empties;
-        for(int i=0; i<4; i++){
-            for(int j=0; j<4; j++){
-                if(s3[i][j]==0){
-                    empties.push_back({i,j});
-                }
-            }
-        }
-
-        std::vector<std::vector<std::vector<int>>> states;
-        std::vector<double> probas;
-        std::vector<long long> rewards;
-        std::vector<bool> dones;
-
-        if(empties.empty()){
-            // single next state
-            states.push_back(s3);
-            probas.push_back(1.0);
-            rewards.push_back(mr);
-            bool stuck = !can_make_move(s3);
-            dones.push_back(stuck);
-            return {states, probas, rewards, dones};
-        }
-
-        for(auto &e : empties){
-            auto st2 = s3;
-            st2[e.first][e.second] = 2;
-            states.push_back(st2);
-            probas.push_back(0.9);
-            rewards.push_back(mr);
-            dones.push_back(!can_make_move(st2));
-
-            st2[e.first][e.second] = 4;
-            states.push_back(st2);
-            probas.push_back(0.1);
-            rewards.push_back(mr);
-            dones.push_back(!can_make_move(st2));
-        }
-        double norm = empties.size();
-        for(double &p: probas) {
-            p /= norm;
-        }
-        return {states, probas, rewards, dones};
-    }
-
-    // Which moves are valid in a given board
-    std::vector<int> get_possible_actions(const std::vector<std::vector<int>>& st) const
-    {
-        std::vector<int> acts;
-        for(int a=0; a<4; a++){
-            auto [s1, c1] = slide(st, a);
-            auto [s2, mr] = merge(s1, a);
-            auto [s3, c2] = slide(s2, a);
-            if(c1+c2>0 || mr>0){
-                acts.push_back(a);
-            }
-        }
-        return acts;
-    }
+struct MoveResult {
+    Board board;
+    int score;
+    bool changed;
 };
 
-////////////////////////////////////////////////////////////////////////////////
-// 2) Environment Wrapper: tile >=512 => done=1 => reward=+1
-//    else if no moves => done=1 => reward=-1, else 0
-////////////////////////////////////////////////////////////////////////////////
-
-class GameEnv {
-private:
-    Game game;
-public:
-    GameEnv() { }
-
-    std::vector<std::vector<int>> get_initial_state()
-    {
-        return game.reset();
+static MoveResult move_left(Board b) {
+    Board result = 0;
+    int score = 0;
+    bool changed = false;
+    for (int r = 0; r < 4; r++) {
+        Row row = get_row(b, r);
+        Row newrow = slide_left_table[row];
+        score += merge_score_table[row];
+        if (newrow != row) changed = true;
+        result = set_row(result, r, newrow);
     }
+    return {result, score, changed};
+}
 
-    std::vector<int> get_possible_actions(const std::vector<std::vector<int>>& st)
-    {
-        return game.get_possible_actions(st);
+static MoveResult move_right(Board b) {
+    Board result = 0;
+    int score = 0;
+    bool changed = false;
+    for (int r = 0; r < 4; r++) {
+        Row row = get_row(b, r);
+        Row rev = reverse_row(row);
+        Row newrow = slide_right_table[row];
+        score += merge_score_table[rev];
+        if (newrow != row) changed = true;
+        result = set_row(result, r, newrow);
     }
+    return {result, score, changed};
+}
 
-    // main transition
-    std::tuple<
-        std::vector<std::vector<std::vector<int>>>,
-        std::vector<double>,
-        std::vector<double>,
-        std::vector<bool>
-    > make_transition(int action, const std::vector<std::vector<int>>& st)
-    {
-        auto [states, probas, merge_rewards, dones] = game.simulate_action(st, action);
+static MoveResult move_up(Board b) {
+    Board t = transpose(b);
+    auto [res, sc, ch] = move_left(t);
+    return {transpose(res), sc, ch};
+}
 
-        std::vector<double> final_rewards(states.size(), 0.0);
-        for(size_t i=0; i<states.size(); i++){
-            bool got_big = false;
-            for(int r=0; r<4; r++){
-                for(int c=0; c<4; c++){
-                    if(states[i][r][c]>=4096){
-                        got_big = true;
-                        break;
-                    }
-                }
-                if(got_big) break;
-            }
-            if(got_big){
-                final_rewards[i] = 1.0;
-                dones[i] = true;
-            }
-            else if(dones[i]){
-                final_rewards[i] = -1.0;
-            }
-            else {
-                final_rewards[i] = 0.0;
-            }
-        }
-        return {states, probas, final_rewards, dones};
+static MoveResult move_down(Board b) {
+    Board t = transpose(b);
+    auto [res, sc, ch] = move_right(t);
+    return {transpose(res), sc, ch};
+}
+
+// action: 0=down, 1=up, 2=right, 3=left
+static MoveResult do_move(Board b, int action) {
+    switch (action) {
+        case 0: return move_down(b);
+        case 1: return move_up(b);
+        case 2: return move_right(b);
+        case 3: return move_left(b);
+        default: return {b, 0, false};
     }
-};
+}
 
-////////////////////////////////////////////////////////////////////////////////
-// 3) Data structures for MCTS
-////////////////////////////////////////////////////////////////////////////////
+static int count_empty(Board b) {
+    int cnt = 0;
+    for (int i = 0; i < 16; i++)
+        if (nibble(b, i) == 0) cnt++;
+    return cnt;
+}
 
-struct ActionNode; // forward
+static int max_tile_log(Board b) {
+    int mx = 0;
+    for (int i = 0; i < 16; i++)
+        mx = std::max(mx, nibble(b, i));
+    return mx;
+}
 
-struct StateNode {
-    std::vector<std::vector<int>> state;
-    int n_visits = 0;
-    bool terminal = false;
-    double terminal_reward = 0.0;
-    int depth = 0;
+static bool can_move(Board b) {
+    for (int a = 0; a < 4; a++) {
+        if (do_move(b, a).changed) return true;
+    }
+    return false;
+}
 
-    // Actions from this state
-    std::vector<int> actions; 
-    std::vector<std::shared_ptr<ActionNode>> children_actions;
-
-    // pointer to parent action
-    std::weak_ptr<ActionNode> parent_action;
-
-    StateNode(const std::vector<std::vector<int>>& s)
-    : state(s)
-    {}
-};
-
-struct ActionNode {
-    int n_visits = 0;
-    double accumulated_value = 0.0;
-    // from this action => set of next states
-    std::vector<std::shared_ptr<StateNode>> children_states;
-    std::vector<double> children_probas;
-
-    // pointer back to parent state
-    std::weak_ptr<StateNode> parent_state;
-};
-
-static bool states_equal(const std::vector<std::vector<int>>& a,
-                         const std::vector<std::vector<int>>& b)
-{
-    for(int i=0; i<4; i++){
-        for(int j=0; j<4; j++){
-            if(a[i][j]!=b[i][j]) return false;
+static Board spawn_tile(Board b, std::mt19937 &rng) {
+    int empty = count_empty(b);
+    if (empty == 0) return b;
+    std::uniform_int_distribution<int> pos_dist(0, empty - 1);
+    int target = pos_dist(rng);
+    int cur = 0;
+    for (int i = 0; i < 16; i++) {
+        if (nibble(b, i) == 0) {
+            if (cur == target) {
+                std::uniform_real_distribution<double> val_dist(0.0, 1.0);
+                int val = (val_dist(rng) < 0.1) ? 2 : 1; // 2 = log2(4), 1 = log2(2)
+                return set_nibble(b, i, val);
+            }
+            cur++;
         }
     }
-    return true;
+    return b;
+}
+
+static std::vector<int> get_possible_actions(Board b) {
+    std::vector<int> acts;
+    for (int a = 0; a < 4; a++) {
+        if (do_move(b, a).changed) acts.push_back(a);
+    }
+    return acts;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// 4) Parallel MCTS
+// 2) Heuristic Evaluation
 ////////////////////////////////////////////////////////////////////////////////
 
-class ParallelMCTS {
+// 4 snake patterns (one per corner), each traversing the board in a
+// monotonically decreasing path. We evaluate all 4 and take the max.
+static const double snake_patterns[4][16] = {
+    // Top-left corner, snaking right-down
+    { 15, 14, 13, 12,
+       8,  9, 10, 11,
+       7,  6,  5,  4,
+       0,  1,  2,  3 },
+    // Top-right corner, snaking left-down
+    { 12, 13, 14, 15,
+      11, 10,  9,  8,
+       4,  5,  6,  7,
+       3,  2,  1,  0 },
+    // Bottom-left corner, snaking right-up
+    {  0,  1,  2,  3,
+       7,  6,  5,  4,
+       8,  9, 10, 11,
+      15, 14, 13, 12 },
+    // Bottom-right corner, snaking left-up
+    {  3,  2,  1,  0,
+       4,  5,  6,  7,
+      11, 10,  9,  8,
+      12, 13, 14, 15 },
+};
+
+static constexpr double HEURISTIC_SCALE = 200000.0;
+
+static double evaluate_board(Board b) {
+    if (!can_move(b)) return -1.0;
+
+    double score = 0.0;
+
+    for (int r = 0; r < 4; r++) {
+        Row row = get_row(b, r);
+        score += heuristic_table[row];
+    }
+    Board t = transpose(b);
+    for (int r = 0; r < 4; r++) {
+        Row row = get_row(t, r);
+        score += heuristic_table[row];
+    }
+
+    double best_snake = -1e18;
+    for (int p = 0; p < 4; p++) {
+        double s = 0.0;
+        for (int i = 0; i < 16; i++) {
+            int v = nibble(b, i);
+            if (v > 0) s += snake_patterns[p][i] * (1 << v);
+        }
+        best_snake = std::max(best_snake, s);
+    }
+    score += best_snake * 0.25;
+
+    return score / HEURISTIC_SCALE;
+}
+
+static const char* action_names[4] = {"down", "up", "right", "left"};
+
+////////////////////////////////////////////////////////////////////////////////
+// 3) Data Structures for MCTS (with sampled chance nodes)
+////////////////////////////////////////////////////////////////////////////////
+
+struct ActionNode;
+
+struct StateNode {
+    Board state;
+    int n_visits = 0;
+    bool terminal = false;
+    double terminal_value = 0.0;
+    int depth = 0;
+
+    std::vector<int> actions;
+    std::vector<std::shared_ptr<ActionNode>> children_actions;
+
+    std::weak_ptr<ActionNode> parent_action;
+
+    StateNode(Board s) : state(s) {}
+};
+
+struct ActionNode {
+    int action_id = -1;
+    int n_visits = 0;
+    double accumulated_value = 0.0;
+    int merge_score = 0;
+    Board after_move;
+
+    // Sampled chance children: map from board -> StateNode
+    std::unordered_map<Board, std::shared_ptr<StateNode>> children_map;
+    // For backprop path, we also keep a vector for iteration
+    std::vector<std::shared_ptr<StateNode>> children_vec;
+
+    std::weak_ptr<StateNode> parent_state;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// 4) MCTS with Heuristic Eval + Sampled Chance Nodes
+//
+// With O(1) heuristic evaluation, each MCTS iteration is very fast.
+// We use a single mutex and run iterations sequentially to avoid contention.
+// Multiple games can be parallelized instead, or we can use batch iterations
+// with coarse-grained parallelism via independent trees.
+//
+// For a single game, sequential MCTS with bitboard + heuristic can easily
+// do 50k+ iterations per move in under a second.
+////////////////////////////////////////////////////////////////////////////////
+
+class MCTS {
 private:
-    GameEnv &env;
-    double gamma;               // discount factor
-    double explore_coef;        // UCB exploration
+    double explore_coef;
     std::shared_ptr<StateNode> root;
-
-    // Use a shared_mutex so that multiple threads can safely read concurrently.
-    mutable std::shared_mutex tree_mutex;
-
-    // Global RNG (used only for seeding local RNGs).
     std::mt19937 rng;
 
 public:
-    ParallelMCTS(GameEnv &game_env, double expc=1.0, double df=0.99)
-    : env(game_env),
-      gamma(df),
-      explore_coef(expc)
-    {
-        std::random_device rd;
-        rng.seed(rd());
-    }
+    MCTS(double expc = 1.41)
+        : explore_coef(expc), rng(std::random_device{}())
+    {}
 
-    // Initialize the root node from an external state.
-    void init_root(const std::vector<std::vector<int>> &st)
-    {
-        std::unique_lock<std::shared_mutex> lock(tree_mutex);
+    void init_root(Board st) {
         root = std::make_shared<StateNode>(st);
         root->depth = 0;
-        root->terminal = false;
-        root->terminal_reward = 0.0;
-        root->n_visits = 0;
+        root->terminal = !can_move(st);
+        root->terminal_value = root->terminal ? -1.0 : 0.0;
     }
 
-    // Expand a node if not already expanded.
-    void expand_node(std::shared_ptr<StateNode> node)
-    {
-        if(node->terminal) return;
-        if(!node->children_actions.empty()) return; // already expanded
+    bool has_root() const { return root != nullptr; }
 
-        auto acts = env.get_possible_actions(node->state);
-        if(acts.empty()){
+    void expand_node(std::shared_ptr<StateNode> node) {
+        if (node->terminal) return;
+        if (!node->children_actions.empty()) return;
+
+        auto acts = get_possible_actions(node->state);
+        if (acts.empty()) {
             node->terminal = true;
-            node->terminal_reward = -1.0;
+            node->terminal_value = -1.0;
             return;
         }
         node->actions = acts;
-        for(auto a : acts){
+        for (int a : acts) {
             auto anode = std::make_shared<ActionNode>();
+            anode->action_id = a;
             anode->parent_state = node;
-
-            // get next states
-            auto [states, probas, rewards, dones] = env.make_transition(a, node->state);
-            for(size_t i=0; i<states.size(); i++){
-                auto sn = std::make_shared<StateNode>(states[i]);
-                sn->terminal = dones[i];
-                sn->terminal_reward = rewards[i];
-                sn->depth = node->depth + 1;
-                sn->parent_action = anode;
-                anode->children_states.push_back(sn);
-                anode->children_probas.push_back(probas[i]);
-            }
+            auto [board, sc, ch] = do_move(node->state, a);
+            anode->after_move = board;
+            anode->merge_score = sc;
             node->children_actions.push_back(anode);
         }
     }
 
-    // UCB selection at a node.
-    // Must be called while holding a shared (read) lock.
-    int select_action_idx_locked(std::shared_ptr<const StateNode> node) const
-    {
-        double best_val = -1e9;
+    int select_action_idx(const StateNode *node) const {
+        double best_val = -1e18;
         int best_idx = 0;
-        for (int i = 0; i < (int)node->children_actions.size(); i++){
+        double log_parent = (node->n_visits > 0) ? std::log((double)node->n_visits) : 0.0;
+        for (int i = 0; i < (int)node->children_actions.size(); i++) {
             auto &actnode = node->children_actions[i];
-            if(actnode->n_visits == 0){
-                return i; // unvisited → infinite priority
-            }
+            if (actnode->n_visits == 0) return i;
             double mean_val = actnode->accumulated_value / (double)actnode->n_visits;
-            double bonus = explore_coef * std::sqrt(std::log(node->n_visits) / (double)actnode->n_visits);
+            double bonus = explore_coef * std::sqrt(log_parent / (double)actnode->n_visits);
             double score = mean_val + bonus;
-            if(score > best_val){
+            if (score > best_val) {
                 best_val = score;
                 best_idx = i;
             }
@@ -578,281 +409,204 @@ public:
         return best_idx;
     }
 
-    // Sample next state from an action node.
-    std::shared_ptr<StateNode> sample_next_state(std::shared_ptr<ActionNode> a_node, std::mt19937 &local_rng)
+    // Progressive widening: only create a new chance child when
+    // visits^pw_alpha > current number of children. Otherwise, revisit
+    // an existing child uniformly at random.
+    static constexpr double pw_alpha = 0.5;
+
+    std::shared_ptr<StateNode> sample_or_create_child(
+        std::shared_ptr<ActionNode> anode, int parent_depth)
     {
-        std::discrete_distribution<int> dist(a_node->children_probas.begin(), a_node->children_probas.end());
-        int idx = dist(local_rng);
-        return a_node->children_states[idx];
+        int n = anode->n_visits + 1;
+        int k = (int)anode->children_vec.size();
+        bool should_widen = (k == 0) || (std::pow((double)n, pw_alpha) > (double)k);
+
+        if (should_widen) {
+            Board spawned = spawn_tile(anode->after_move, rng);
+            auto it = anode->children_map.find(spawned);
+            if (it != anode->children_map.end()) return it->second;
+
+            auto sn = std::make_shared<StateNode>(spawned);
+            sn->depth = parent_depth + 1;
+            sn->terminal = !can_move(spawned);
+            sn->terminal_value = sn->terminal ? -1.0 : 0.0;
+            sn->parent_action = anode;
+            anode->children_map[spawned] = sn;
+            anode->children_vec.push_back(sn);
+            return sn;
+        }
+
+        // Revisit an existing child
+        std::uniform_int_distribution<int> dist(0, k - 1);
+        return anode->children_vec[dist(rng)];
     }
 
-    // Single-thread selection + expansion.
-    std::shared_ptr<StateNode> select_and_expand(std::mt19937 &local_rng)
-    {
-        std::shared_ptr<StateNode> node;
-        { // acquire shared lock to safely read the root.
-            std::shared_lock<std::shared_mutex> lock(tree_mutex);
-            node = root;
+    void do_one_iteration() {
+        auto node = root;
+        while (!node->terminal && !node->children_actions.empty()) {
+            int idx = select_action_idx(node.get());
+            auto &action_node = node->children_actions[idx];
+            node = sample_or_create_child(action_node, node->depth);
         }
-        while (true) {
-            if(node->terminal)
-                break;
-            {
-                // Acquire shared lock to safely read children_actions.
-                std::shared_lock<std::shared_mutex> lock(tree_mutex);
-                if(node->children_actions.empty())
-                    break;
-                // Use the locked version of UCB selection.
-                int idx = select_action_idx_locked(node);
-                auto action_node = node->children_actions[idx];
-                // Sample next state from the chosen action.
-                node = sample_next_state(action_node, local_rng);
-            }
-        }
-        // Now, acquire an exclusive lock to expand the node.
-        {
-            std::unique_lock<std::shared_mutex> lock(tree_mutex);
+
+        if (!node->terminal && node->children_actions.empty()) {
             expand_node(node);
         }
-        return node;
-    }
 
-    // --- ROLLOUT PARALLELIZATION ---
-    // Run multiple random simulations (rollouts) from a given leaf and average their values.
-    double parallel_rollout(std::shared_ptr<StateNode> leaf, int num_rollouts)
-    {
-        if(leaf->terminal){
-            return leaf->terminal_reward; 
+        double val;
+        if (node->terminal) {
+            val = -1.0;
+        } else {
+            val = evaluate_board(node->state);
         }
 
-        std::vector<double> results(num_rollouts, 0.0);
-
-        #pragma omp parallel
-        {
-            std::mt19937 local_rng(std::random_device{}());
-            #pragma omp for
-            for (int i = 0; i < num_rollouts; i++){
-                results[i] = single_rollout(*leaf, local_rng);
-            }
-        }
-
-        double sum = 0.0;
-        for(double v : results)
-            sum += v;
-        return sum / (double)num_rollouts;
-    }
-
-    // A single random rollout from a node until terminal.
-    double single_rollout(const StateNode &start_node, std::mt19937 &local_rng)
-    {
-        if(start_node.terminal){
-            return start_node.terminal_reward;
-        }
-
-        auto state = start_node.state;
-        int depth_ = start_node.depth;
-        bool done = start_node.terminal;
-        double total_reward = 0.0;
-
-        while (!done) {
-            auto actions = env.get_possible_actions(state);
-            if (actions.empty()){
-                total_reward += std::pow(gamma, depth_) * (-1.0);
-                break;
-            }
-            std::uniform_int_distribution<int> adist(0, (int)actions.size() - 1);
-            int chosen_action = actions[adist(local_rng)];
-
-            auto [states, probas, rewards, dones] = env.make_transition(chosen_action, state);
-            std::discrete_distribution<int> ddist(probas.begin(), probas.end());
-            int idx = ddist(local_rng);
-
-            total_reward += std::pow(gamma, depth_) * rewards[idx];
-            state = states[idx];
-            done = dones[idx];
-            depth_++;
-        }
-        return total_reward;
-    }
-
-    // Backpropagation: update visits and accumulated_value.
-    void backprop(std::shared_ptr<StateNode> leaf, double value)
-    {
-        std::unique_lock<std::shared_mutex> lock(tree_mutex);
-        auto node = leaf;
+        auto cur = node;
         while (true) {
-            node->n_visits += 1;
-            auto pa = node->parent_action.lock();
-            if (!pa)
-                break;  // reached the root
+            cur->n_visits += 1;
+            auto pa = cur->parent_action.lock();
+            if (!pa) break;
             pa->n_visits += 1;
-            pa->accumulated_value += value;
+            pa->accumulated_value += val;
             auto st_parent = pa->parent_state.lock();
-            if (!st_parent)
-                break;
-            node = st_parent;
+            if (!st_parent) break;
+            cur = st_parent;
         }
     }
 
-    // One iteration: selection, expansion, rollout, backpropagation.
-    void do_one_iteration()
-    {
-        std::mt19937 local_rng(std::random_device{}());
-        auto leaf = select_and_expand(local_rng);
-        double val = parallel_rollout(leaf, /*num_rollouts=*/10);
-        backprop(leaf, val);
-    }
-
-    // TREE PARALLELIZATION: run N iterations in parallel.
-    void run_mcts(int n_iterations)
-    {
+    void run_mcts(int n_iterations) {
         if (!root) return;
-        #pragma omp parallel for
-        for (int i = 0; i < n_iterations; i++){
+        for (int i = 0; i < n_iterations; i++) {
             do_one_iteration();
         }
     }
 
-    // Pick the best action from the root.
-    int get_best_action()
-    {
-        std::shared_lock<std::shared_mutex> lock(tree_mutex);
-        if (!root || root->children_actions.empty())
-            return -1;
-        double best_val = -1e9;
+    int get_best_action() const {
+        if (!root || root->children_actions.empty()) return -1;
+        int best_visits = -1;
         int best_idx = -1;
-        for (int i = 0; i < (int)root->children_actions.size(); i++){
+        for (int i = 0; i < (int)root->children_actions.size(); i++) {
             auto &an = root->children_actions[i];
-            if (an->n_visits == 0)
-                continue;
-            double q = an->accumulated_value / (double)an->n_visits;
-            if (q > best_val){
-                best_val = q;
+            if (an->n_visits > best_visits) {
+                best_visits = an->n_visits;
                 best_idx = i;
             }
         }
-        if (best_idx < 0)
-            return -1;
+        if (best_idx < 0) return -1;
         return root->actions[best_idx];
     }
 
-    bool has_root() const
-    {
-        std::shared_lock<std::shared_mutex> lock(tree_mutex);
-        return root != nullptr;
+    void print_root_stats() const {
+        if (!root) return;
+        for (int i = 0; i < (int)root->children_actions.size(); i++) {
+            auto &an = root->children_actions[i];
+            double q = (an->n_visits > 0) ? an->accumulated_value / an->n_visits : 0;
+            std::cout << "  " << action_names[root->actions[i]]
+                      << ": visits=" << an->n_visits
+                      << " Q=" << q << "\n";
+        }
     }
 
-    // Choose the next state matching the environment outcome to "re-root" the tree.
-    void select_branch(int action, const std::vector<std::vector<int>> &new_state)
-    {
-        std::unique_lock<std::shared_mutex> lock(tree_mutex);
-        if (!root)
-            return;
+    void select_branch(int action, Board new_state) {
+        if (!root) return;
 
         int aidx = -1;
-        for (int i = 0; i < (int)root->actions.size(); i++){
-            if (root->actions[i] == action) {
-                aidx = i;
-                break;
-            }
+        for (int i = 0; i < (int)root->actions.size(); i++) {
+            if (root->actions[i] == action) { aidx = i; break; }
         }
-        if (aidx < 0) {
-            root.reset();
-            return;
-        }
+        if (aidx < 0) { root.reset(); return; }
 
         auto anode = root->children_actions[aidx];
-        int found = -1;
-        for (int i = 0; i < (int)anode->children_states.size(); i++){
-            if (states_equal(anode->children_states[i]->state, new_state)) {
-                found = i;
-                break;
-            }
-        }
-        if (found < 0) {
-            root.reset();
-            return;
-        }
-        auto new_root = anode->children_states[found];
+        auto it = anode->children_map.find(new_state);
+        if (it == anode->children_map.end()) { root.reset(); return; }
+
+        auto new_root = it->second;
         new_root->parent_action.reset();
         root = new_root;
     }
 };
 
 ////////////////////////////////////////////////////////////////////////////////
-// 5) Utility function to print the board
+// 5) Utility
 ////////////////////////////////////////////////////////////////////////////////
 
-static void print_board(const std::vector<std::vector<int>>& board)
-{
-    for (auto &row : board){
-        for (size_t i = 0; i < row.size(); i++){
-            if (i > 0) std::cout << " ";
-            std::cout << row[i];
+static void print_board(Board b) {
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            int val = nibble(b, r * 4 + c);
+            if (c > 0) std::cout << "\t";
+            std::cout << (val ? (1 << val) : 0);
         }
         std::cout << "\n";
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// 6) Main demonstration
+// 6) Main
 ////////////////////////////////////////////////////////////////////////////////
 
-int main()
-{
-    // Create environment
-    GameEnv env;
-    // Create parallel MCTS with chosen exploration coefficient and discount factor.
-    ParallelMCTS mcts(env, /*explore_coef=*/0.01, /*discount=*/0.999);
+int main() {
+    init_tables();
 
-    // Get initial board from the environment.
-    auto state = env.get_initial_state();
+    double explore_coef = 1.5;
+    int n_iter = 10000;
+    int print_every = 50;
+
+    MCTS mcts(explore_coef);
+    std::mt19937 game_rng(std::random_device{}());
+    Board state = 0;
+    state = spawn_tile(state, game_rng);
+    state = spawn_tile(state, game_rng);
     mcts.init_root(state);
 
     int step = 0;
-    while (true) {
-        std::cout << "Step " << step << "\n";
-        print_board(state);
+    int total_merge_score = 0;
+    auto t_start = std::chrono::steady_clock::now();
 
-        // Run parallel MCTS for a given number of iterations (tune as desired).
-        int n_iter = 2000;  
+    while (true) {
+        if (step % print_every == 0) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - t_start).count();
+            std::cout << "Step " << step
+                      << "  Score=" << total_merge_score
+                      << "  MaxTile=" << (1 << max_tile_log(state))
+                      << "  Time=" << elapsed << "s\n";
+            print_board(state);
+            std::cout << "\n";
+        }
+
         mcts.run_mcts(n_iter);
 
-        // Pick best action from the root.
         int best_a = mcts.get_best_action();
         if (best_a < 0) {
-            std::cout << "No moves left. Stopping.\n";
+            std::cout << "No moves left at step " << step << ".\n";
             break;
         }
 
-        // Apply environment step.
-        auto [n_states, probas, rewards, dones] = env.make_transition(best_a, state);
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::discrete_distribution<int> dd(probas.begin(), probas.end());
-        int idx = dd(gen);
+        auto [new_board, mscore, changed] = do_move(state, best_a);
+        total_merge_score += mscore;
+        Board spawned = spawn_tile(new_board, game_rng);
 
-        state = n_states[idx];
-        double rew = rewards[idx];
-        bool done = dones[idx];
+        mcts.select_branch(best_a, spawned);
+        if (!mcts.has_root()) mcts.init_root(spawned);
 
-        std::cout << "Chosen action = " << best_a 
-                  << ", reward = " << rew 
-                  << ", done = " << done << "\n";
-
-        if (done) {
-            std::cout << "Game finished!\n";
-            print_board(state);
-            break;
-        }
-
-        // Re-root the tree based on the chosen action and resulting state.
-        mcts.select_branch(best_a, state);
-        if (!mcts.has_root()) {
-            mcts.init_root(state);
-        }
+        state = spawned;
         step++;
+
+        if (!can_move(state)) {
+            std::cout << "Game over at step " << step << "!\n";
+            break;
+        }
     }
+
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(t_end - t_start).count();
+
+    std::cout << "\nFinal board:\n";
+    print_board(state);
+    std::cout << "Score: " << total_merge_score << "\n";
+    std::cout << "Max tile: " << (1 << max_tile_log(state)) << "\n";
+    std::cout << "Steps: " << step << "\n";
+    std::cout << "Time: " << elapsed << "s\n";
 
     return 0;
 }
