@@ -59,8 +59,13 @@ def main():
     ap.add_argument("--dirichlet-alpha", type=float, default=0.5)
     ap.add_argument("--dirichlet-eps", type=float, default=0.25)
     ap.add_argument("--eval-games", type=int, default=32)
+    ap.add_argument("--eval-sims", type=int, default=0,
+                    help="sims for eval play (0 = same as --sims)")
+    ap.add_argument("--target-tile", type=int, default=0,
+                    help="stop once any self-play or eval game reaches this tile")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    eval_sims = args.eval_sims or args.sims
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.run, exist_ok=True)
@@ -104,7 +109,7 @@ def main():
         tr_time = time.time() - t0
 
         t0 = time.time()
-        _, eres = play_games(net, device, args.eval_games, args.sims,
+        _, eres = play_games(net, device, args.eval_games, eval_sims,
                              args.n_parallel, args.c_puct,
                              dirichlet_alpha=args.dirichlet_alpha, dirichlet_eps=0.0,
                              seed=int(rng.integers(2**63)))
@@ -122,7 +127,15 @@ def main():
         print(f"gen {gen}: selfplay {sp['score_mean']:.0f} "
               f"(max {sp['score_max']}, {sp_time:.0f}s, entropy {ent:.3f}) | "
               f"train p={loss_p:.4f} v={loss_v:.5f} ({tr_time:.0f}s) | "
-              f"eval {ev['score_mean']:.0f} tiles {ev['tiles']} ({ev_time:.0f}s)")
+              f"eval {ev['score_mean']:.0f} tiles {ev['tiles']} ({ev_time:.0f}s)",
+              flush=True)
+
+        if args.target_tile:
+            best_tile = max(max(sp["tiles"]), max(ev["tiles"]))
+            if best_tile >= args.target_tile:
+                print(f"TARGET REACHED: tile {best_tile} >= {args.target_tile} "
+                      f"at generation {gen}", flush=True)
+                break
 
     log_f.close()
 
