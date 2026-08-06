@@ -95,7 +95,7 @@ def main():
         sp = result_stats(res)
 
         boards, pi, z = make_targets(ex)
-        ent = float(-(np.where(pi > 0, pi * np.log(pi), 0)).sum(1).mean())
+        ent = float(-(pi * np.log(np.clip(pi, 1e-12, None))).sum(1).mean())
         buffer.add(boards, pi, z)
 
         t0 = time.time()
