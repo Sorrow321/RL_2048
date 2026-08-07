@@ -89,14 +89,30 @@ python -m az.eval --ckpt runs/az0/latest.pt --games 100 --greedy
 
 Metrics per generation go to `<run>/log.csv`.
 
-## Design notes
+## Reward and training targets
 
-- Value target: `log1p(future merge score) / 12` — death is exactly 0,
-  strong late-game positions approach ~1. The tree backs up leaf values
-  only; terminal leaves back up 0 without calling the net.
-- Policy target: PUCT root visit distributions. (The bootstrap trains on
-  hard argmax labels instead — UCB1 visit counts in the heuristic search
-  are near-uniform and carry little signal.)
+- **Environment reward** is the standard 2048 merge score: a move earns
+  the summed values of all tiles created by merges on that move (merging
+  two 64s earns 128). There is no other reward — no bonus for reaching a
+  tile, no penalty for dying beyond the future score becoming 0.
+- **Value target** for a position is the *total future merge score* from
+  that position to the end of its game, squashed to `log1p(future_score) / 12`
+  so it lands roughly in [0, 1]. A dead position has future score 0 and
+  therefore value exactly 0; strong late-game positions approach ~1.
+  Targets are computed after each game from the recorded per-move rewards.
+- **Inside the search**, the net's scalar value is the only signal backed
+  up the tree (terminal leaves back up 0 without calling the net).
+  Per-move rewards are *not* accumulated along tree paths — log-scaled
+  values don't compose additively, so the net is trained to estimate the
+  aggregate directly instead.
+- **Policy target**: PUCT root visit distributions from self-play. (The
+  heuristic bootstrap trains on hard argmax labels instead — UCB1 visit
+  counts are near-uniform and carry little signal.)
+- **Move selection** in self-play: argmax of root visits, with Dirichlet
+  noise on root priors for exploration; the environment's random tile
+  spawns already provide game diversity, so no temperature sampling.
+
+## Design notes
 - Chance nodes sample spawns from the true 90/10 distribution with
   progressive widening and deduplication.
 - Trees are arena-allocated and rebuilt each move: with 2048's chance
