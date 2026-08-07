@@ -1,10 +1,26 @@
 # RL 2048 — AlphaZero with a C++ MCTS engine
 
+<p align="center">
+  <img src="assets/demo.gif" width="320"
+       alt="Trained AlphaZero agent playing 2048: 4,676 moves, score 112,916, reaching the 8192 tile">
+  <br>
+  <em>The trained agent reaching the 8192 tile — 4,676 moves, score 112,916
+  (10× sped up; render your own with <code>az.render_gif</code>)</em>
+</p>
+
 AlphaZero for 2048: the game and the search trees live in C++ (bitboard
 engine, PUCT MCTS, sampled chance nodes), PyTorch stays in Python. The
 bridge is batched — a `Runner` steps hundreds of concurrent games, pauses
 each at leaves needing evaluation, and Python answers all of them with a
 single GPU forward per cycle.
+
+## Results
+
+Trained overnight on a single RTX 5090 (~7h wall clock, ~60 generations of
+256 self-play games): the 840k-parameter net reaches **8192** in ~1–2% of
+games and **4096** in ~44% when evaluated at 1536 sims/move, with mean
+score ~47k. The net surpasses the heuristic teacher that bootstrapped it
+by generation 14, using 40× fewer simulations per move.
 
 ## Layout
 
