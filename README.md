@@ -33,13 +33,44 @@ by generation 14, using 40× fewer simulations per move.
     MCTS_ITERS=10000 ./run_2048_mcts`
 - `az/` — Python package: net, data, self-play driver, training, eval.
 
-## Build
+## Setup
 
 ```bash
+git clone --recursive git@github.com:Sorrow321/RL_2048.git   # pybind11 is a submodule
+cd RL_2048
+git lfs pull                       # fetches the trained checkpoint
+pip install -r requirements.txt    # torch with CUDA recommended
+
+# build the C++ engine module (needs cmake, g++, OpenMP)
 cmake -S . -B build -DPython_EXECUTABLE=$(which python) -DPYBIND11_FINDPYTHON=ON
-cmake --build build -j            # -> ./az_engine*.so at repo root
+cmake --build build -j             # -> ./az_engine*.so at repo root
+
+# optional: the standalone heuristic MCTS binary
 g++ -std=c++17 -O3 -march=native -pthread pure_cpp/run_2048_mcts.cpp \
     -o pure_cpp/run_2048_mcts
+```
+
+## Run the trained agent
+
+The checkpoint that reached 8192 ships in `checkpoints/az_8192.pt` (git LFS,
+3.4 MB, 840k parameters). From the repo root:
+
+```bash
+# evaluate: 64 games with MCTS at 1536 sims/move (the 8192-level setting)
+python -m az.eval --ckpt checkpoints/az_8192.pt --games 64 --sims 1536
+
+# quick strength check at lighter search
+python -m az.eval --ckpt checkpoints/az_8192.pt --games 64 --sims 256
+
+# raw policy, no search at all
+python -m az.eval --ckpt checkpoints/az_8192.pt --games 100 --greedy
+
+# record the best of N games and replay it in the terminal
+python -m az.watch --ckpt checkpoints/az_8192.pt --games 32 --sims 512 --out game.json
+python -m az.watch --show game.json --fps 15
+
+# render a recorded game as an animated GIF (like the one above)
+python -m az.render_gif game.json demo.gif
 ```
 
 ## Train

@@ -8,7 +8,7 @@ build/
 __pycache__
 runs/
 tb_logs/
-checkpoints/
 *.pt
 *.bin
 *.csv
+!checkpoints/*.pt
